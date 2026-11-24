@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>مكالمة صوتية</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: #0a0a0a; color: #f5f5f5;
+    font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+    min-height: 100vh;
+  }
+  #app { max-width: 560px; margin: 0 auto; padding: 20px 16px 32px; text-align: center; }
+  h1 { color: #d4af37; font-size: 26px; margin: 8px 0 4px; }
+  #status {
+    color: #cfcfcf; font-size: 16px; min-height: 24px; margin: 6px 0 14px;
+  }
+  #status.err { color: #ff7b7b; }
+  #transcript {
+    text-align: right; background: #141414; border: 1px solid #2a2a2a;
+    border-radius: 14px; padding: 12px; min-height: 220px; max-height: 46vh;
+    overflow-y: auto; margin-bottom: 10px;
+  }
+  .bubble { margin: 8px 0; padding: 10px 12px; border-radius: 12px; font-size: 18px; line-height: 1.7; word-wrap: break-word; }
+  .bubble.you { background: #1e2a1e; border: 1px solid #2f4d2f; }
+  .bubble.you::before { content: "أنت: "; color: #9fd6a0; font-weight: bold; }
+  .bubble.bot { background: #241d05; border: 1px solid #d4af37; }
+  .bubble.bot::before { content: "البوت: "; color: #d4af37; font-weight: bold; }
+  #interim { color: #9a9a9a; font-size: 16px; min-height: 24px; margin-bottom: 14px; font-style: italic; }
+  #micBtn {
+    width: 120px; height: 120px; border-radius: 50%;
+    border: 3px solid #d4af37; background: #d4af37; color: #111;
+    font-size: 22px; font-weight: bold; cursor: pointer; margin: 8px auto;
+    display: block;
+  }
+  #micBtn:disabled { background: #555; border-color: #555; color: #999; cursor: not-allowed; }
+  #micBtn.on { background: #b3261e; border-color: #ff6b61; color: #fff; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,107,97,.5); } 70% { box-shadow: 0 0 0 18px rgba(255,107,97,0); } 100% { box-shadow: 0 0 0 0 rgba(255,107,97,0); } }
+  #endBtn {
+    margin-top: 16px; padding: 12px 28px; font-size: 18px;
+    background: transparent; color: #ff7b7b; border: 2px solid #b3261e;
+    border-radius: 30px; cursor: pointer;
+  }
+  #endBtn:disabled { color: #666; border-color: #444; cursor: not-allowed; }
+  .hint { color: #888; font-size: 14px; margin-top: 18px; line-height: 1.8; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>مكالمة صوتية</h1>
+  <div id="status">جاري التجهيز...</div>
+  <div id="transcript"></div>
+  <div id="interim"></div>
+  <button id="micBtn" disabled>تحدث</button>
+  <button id="endBtn" disabled>إنهاء المكالمة</button>
+  <div class="hint">اتكلم عادي باللهجة المصرية، والبوت هيسمعك ويرد عليك صوت.</div>
+</div>
+<script>
+// Voice-call Mini App page.
+// Browser speech does the voice work on the PHONE (Web Speech API):
+//   SpeechRecognition turns your speech into text  -> sent to the bot brain
+//   speechSynthesis speaks the bot's text reply out loud
+// The relay only moves TEXT back and forth; no voice audio leaves the phone
+// except to the browser's own speech service (Google on Android/Chrome).
+//
+// TODO (PRODUCTION): send Telegram.WebApp.initData with every user_text
+// message so the relay can verify it (HMAC-SHA256 with the bot token) and
+// trust chat_id/first_name. This POC takes them from initDataUnsafe
+// (client-provided, unverified). Do NOT ship to real users without it.
+
+(function () {
+  var statusEl = document.getElementById('status');
+  var transcriptEl = document.getElementById('transcript');
+  var interimEl = document.getElementById('interim');
+  var micBtn = document.getElementById('micBtn');
+  var endBtn = document.getElementById('endBtn');
+
+  var callId = 'c' + Date.now();
+  var ws = null;
+  var listening = false;
+  var rec = null;
+  var ended = false;
+  var restartStreak = 0;
+  var lastRestart = 0;
+
+  function setStatus(text, isErr) {
+    statusEl.textContent = text;
+    statusEl.className = isErr ? 'err' : '';
+  }
+  function addBubble(who, text) {
+    var d = document.createElement('div');
+    d.className = 'bubble ' + who;
+    d.textContent = text;
+    transcriptEl.appendChild(d);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+  function esc(s) { return s; } // textContent is used everywhere, no HTML injection
+
+  // ---- Telegram user -------------------------------------------------------
+  var tgUser = null;
+  try {
+    if (window.Telegram && Telegram.WebApp) {
+      Telegram.WebApp.ready();
+      Telegram.WebApp.expand();
+      tgUser = Telegram.WebApp.initDataUnsafe && Telegram.WebApp.initDataUnsafe.user;
+    }
+  } catch (e) { tgUser = null; }
+
+  if (!tgUser || !tgUser.id) {
+    setStatus('افتح المكالمة من البوت عشان أعرف أنت مين.', true);
+    return;
+  }
+
+  // ---- Speech recognition support ------------------------------------------
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    setStatus('المتصفح ده مش بيدعم التحدث — جرّب من تليفون تاني أو استخدم الرسايل الصوتية.', true);
+    return;
+  }
+
+  // ---- Connect to the relay -------------------------------------------------
+  // Same-origin WebSocket: this page is served by the remote relay itself
+  // (Replit), so the relay is always on the same host that served the page.
+  // No public-url.txt lookup, no hardcoded domain.
+  (function () {
+    var wsProto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+    connect(wsProto + window.location.host + '/ws');
+  })();
+
+  function connect(url) {
+    try { ws = new WebSocket(url); } catch (e) {
+      setStatus('تعذر الاتصال — جرّب تاني بعد شوية.', true);
+      return;
+    }
+    ws.onopen = function () {
+      setStatus('متصل — دوس "تحدث" واتكلم.');
+      micBtn.disabled = false;
+      endBtn.disabled = false;
+    };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'bot_reply' && msg.text) {
+        addBubble('bot', msg.text);
+        setStatus('البوت بيرد...');
+        speak(msg.text);
+        setTimeout(function () { if (!ended) setStatus(listening ? 'بيسمع...' : 'متصل — دوس "تحدث" واتكلم.'); }, 500);
+      } else if (msg.type === 'ack') {
+        setStatus('وصلت، مستني الرد...');
+      } else if (msg.type === 'error') {
+        setStatus('حصلت مشكلة، جرّب تقولها تاني.', true);
+      }
+    };
+    ws.onclose = function () {
+      if (!ended) setStatus('انقطع الاتصال — اقفل الصفحة وافتح المكالمة تاني من البوت.', true);
+      micBtn.disabled = true;
+    };
+    ws.onerror = function () {
+      setStatus('تعذر الاتصال — جرّب تاني بعد شوية.', true);
+    };
+  }
+
+  function sendUserText(text) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setStatus('مش متصل — اقفل الصفحة وافتح المكالمة تاني من البوت.', true);
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: 'user_text',
+      call_id: callId,
+      chat_id: tgUser.id,
+      first_name: tgUser.first_name || 'صديقي',
+      username: tgUser.username || null,
+      text: text
+    }));
+  }
+
+  // ---- Speech recognition ----------------------------------------------------
+  function makeRec() {
+    var r = new SR();
+    r.lang = 'ar-EG';
+    r.continuous = true;
+    r.interimResults = true;
+    r.onresult = function (ev) {
+      var interim = '';
+      var finals = [];
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var res = ev.results[i];
+        if (res.isFinal) finals.push(res[0].transcript);
+        else interim += res[0].transcript;
+      }
+      interimEl.textContent = interim;
+      finals.forEach(function (t) {
+        t = (t || '').trim();
+        if (!t) return;
+        interimEl.textContent = '';
+        addBubble('you', t);
+        setStatus('وصلت، مستني الرد...');
+        sendUserText(t);
+      });
+    };
+    r.onerror = function (ev) {
+      var err = ev.error || '';
+      if (err === 'not-allowed' || err === 'service-not-allowed') {
+        listening = false;
+        micBtn.textContent = 'تحدث';
+        micBtn.classList.remove('on');
+        setStatus('المايك مقفول — اسمح للمايك من إعدادات المتصفح وافتح المكالمة تاني.', true);
+      } else if (err === 'network') {
+        setStatus('مشكلة في خدمة تحويل الصوت — جرّب تقولها تاني.', true);
+      }
+      // 'no-speech' / 'aborted' / 'audio-capture': ignore, onend restarts if still listening
+    };
+    r.onend = function () {
+      if (!listening || ended) return;
+      // Continuous mode can stop on silence; restart while the mic is on.
+      // Guard against a hot restart loop.
+      var now = Date.now();
+      restartStreak = (now - lastRestart < 2000) ? restartStreak + 1 : 0;
+      lastRestart = now;
+      if (restartStreak > 5) {
+        listening = false;
+        micBtn.textContent = 'تحدث';
+        micBtn.classList.remove('on');
+        setStatus('المايك وقف — دوس "تحدث" تاني.', true);
+        return;
+      }
+      setTimeout(function () {
+        if (listening && !ended) { try { r.start(); } catch (e) {} }
+      }, 300);
+    };
+    return r;
+  }
+
+  micBtn.addEventListener('click', function () {
+    if (ended) return;
+    if (!listening) {
+      try {
+        if (!rec) rec = makeRec();
+        rec.start();
+        listening = true;
+        micBtn.textContent = 'إيقاف';
+        micBtn.classList.add('on');
+        setStatus('بيسمع... اتكلم.');
+      } catch (e) {
+        setStatus('مش قادر أشغّل المايك — جرّب تاني.', true);
+      }
+    } else {
+      listening = false;
+      try { rec.stop(); } catch (e) {}
+      micBtn.textContent = 'تحدث';
+      micBtn.classList.remove('on');
+      setStatus('متصل — دوس "تحدث" واتكلم.');
+    }
+  });
+
+  // ---- Speech synthesis (bot replies out loud) -------------------------------
+  function speak(text) {
+    if (!('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ar-EG';
+      var voices = window.speechSynthesis.getVoices() || [];
+      var v = null;
+      for (var i = 0; i < voices.length; i++) {
+        var l = (voices[i].lang || '').toLowerCase();
+        if (l.indexOf('ar-eg') === 0) { v = voices[i]; break; }
+      }
+      if (!v) for (var j = 0; j < voices.length; j++) {
+        var l2 = (voices[j].lang || '').toLowerCase();
+        if (l2.indexOf('ar') === 0) { v = voices[j]; break; }
+      }
+      if (v) u.voice = v;
+      window.speechSynthesis.speak(u);
+    } catch (e) {}
+  }
+
+  // ---- End call ---------------------------------------------------------------
+  endBtn.addEventListener('click', function () {
+    ended = true;
+    listening = false;
+    try { if (rec) rec.stop(); } catch (e) {}
+    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (e) {}
+    try { if (ws) ws.close(); } catch (e) {}
+    micBtn.disabled = true;
+    endBtn.disabled = true;
+    setStatus('انتهت المكالمة.');
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.23.0"},"description":"Remote voice-call relay for @souqverse_bot Mini App — serves call.html, queues user_text for the local bridge (bridge.js on the VM)","engines":{"node":">=18"},"main":"remote-relay.js","name":"souqverse-voice-call-remote-relay","scripts":{"start":"node remote-relay.js"},"version":"1.0.0"}
